@@ -1,31 +1,41 @@
 # mnc.py
-# Movements, Not Chords
+# Movements, Not Chords by Trevor Ritchie
 #
-# This program is an instrument, intended to be played with the TouchOSC mobile app on a smartphone.
-# Using 8 note "scales of chords", contrary motion can be done indefinitely,
-# alternating between an "on" and "off" chord. The "off" chord is always a diminished seventh,
-# and the "on" chord consists of a combination of notes from the other two possible diminished chords.
-# "On" chords of the same type, that share the same "off" chord, are family!
-#
-# region Changelog
-# 7.30.24:
-# Chords only play when tapped. Limited to 4 voices for polyphonic clarity. 
-# When switching to a different chord, always locks to on chord. Bass note plays for chord button.
-# Contrary motion on roll, and oblique motion (holding bottom note) on pitch.
-# Separated buttonOperations into its own function to clean up handleTouchInputs.
-# Alternate scale of chords button added. "Make Dominant" button Added.
-# Family up, down, and across added.
-#
-# endregion
+# This program is a musical instrument, 
+# played with touch and accelerometer inputs from the TouchOSC mobile app on a smartphone.
+# See the README for detailed performance instructions and a brief introduction to the music theory.
 
 from midi import *
 from music import *
 from osc import *
 from timer import *
+import sys
 
-# region Global Variables
+######## USER SETTINGS #########
+TRANSPOSE_KEY_SEMITONES = -3  # 0 = C, 2 = D, -2 = Bb, +10 = Bb, etc.
+BASS = True                   # want a bass root note for each chord numeral?
+DECAY = False                 # want notes to decay quicker?
+DECAY_TIME_MS = 10            # time between each volume decrement in ms
+OSC_LISTENER_PORT = 50380     # what port do you want to send OSC messages to?
 
-# region Scales of Chords
+# Choose MIDI Sounds
+# For all instrument constants, see https://jythonmusic.me/api/midi-constants/instrument/
+Play.setInstrument(NYLON_GUITAR, 0)  # channel 0 for top 4 voices
+Play.setInstrument(SAWTOOTH, 1)      # channel 1 for bass
+################################
+
+# region MIDI Sound Suggestions:
+# Play.setInstrument(PIANO, 0) 
+# Play.setInstrument(JAZZ_GUITAR, 0) 
+# Play.setInstrument(DISTORTION_GUITAR, 0)
+# Play.setInstrument(SQUARE, 0) 
+# Play.setInstrument(SAWTOOTH, 0) 
+# Play.setInstrument(SQUARE, 1) 
+# Play.setInstrument(ACOUSTIC_BASS, 1) 
+# Play.setInstrument(DISTORTION_GUITAR, 1)
+# endregion
+
+# region Constants
 # Scales of chords by "pitch class". Semitones are assigned to 0-11. 
 MAJOR_SIXTH_DIMINISHED_SCALE = [0, 2, 4, 5, 7, 8, 9, 11]    
 MAJOR_SIXTH_DIMINISHED_SCALE_FROM_THIRD = [0, 1, 3, 4, 5, 7, 8, 10]   
@@ -44,29 +54,6 @@ DOMINANT_SEVENTH_DIMINISHED_SCALE_FROM_SEVENTH = [0, 1, 2, 4, 6, 7, 9, 10]
 
 DOMINANT_SEVENTH_FLAT_FIVE_DIMINISHED_SCALE = [0, 2, 4, 5, 6, 8, 10, 11]
 DOMINANT_ROOTS_AND_THEIR_DIMINISHED = [0, 2, 3, 5, 6, 8, 9, 11] # aka whole-half diminished scale
-# endregion
-
-key = MAJOR_SCALE # 7 note scales, different from the "scales of chords". Used to follow typical chord progression notations.
-keyRoot = C_1 # the root of the 7 note home scale
-scaleOfChords = MAJOR_SIXTH_DIMINISHED_SCALE # choose a chord scale to move through
-scaleOfChordsRoot = C_1 # the root of the scale of chords
-pivotPitch = C4 # the note around which the contrary motion expands/shrinks
-                # if the pivot pitch is played, only that single pitch will sound
-bassNote = C3
-keysPressed = 0
-buttonsHeld = 0
-lastButtonPressed = ""
-lastChord = []
-chordNumeral = 1
-onChordLock = False
-offChordLock = False
-alternate = False # alternate scale of chords for each chord numeral in the key
-dominant = False
-familyUp = False
-familyDown = False
-familyAcross = False
-eightChord = False
-accelerometerValues = []
 
 # Mapping chord numerals of a key to button names
 chordNumeralToButtonNameDict = {
@@ -79,122 +66,111 @@ chordNumeralToButtonNameDict = {
     7 : "h7",
     8 : "h3"
 }
+
+KEY = MAJOR_SCALE  # 7 note scales, different from the "scales of chords". Used to follow typical chord progression notations.
+OCTAVE = 12  # 12 semitones in an octave
+BASS_OCTAVE_OFFSET =  OCTAVE * 3
+# endregion
+
+# region Global Variables
+scaleOfChords = MAJOR_SIXTH_DIMINISHED_SCALE # choose a chord scale to move through
+scaleOfChordsRoot = KEY[0] # the root of the scale of chords
+pivotPitch = OCTAVE * 5 # the note around which the contrary motion expands/shrinks
+                # if the pivot pitch is played, only that single pitch will sound
+bassNote = OCTAVE * 4
+keysPressed = 0
+buttonsHeld = 0
+lastChord = []
+chordNumeral = 1
+offChordLock = False
+alternate = False # alternate scale of chords for each chord numeral in the key
+dominant = False
+familyUp = False
+familyDown = False
+familyAcross = False
+accelerometerValues = []
 # endregion
 
 # region Functions
-# turn volume down on a repeating timer, achieves decay effect
+# turn volume down on a repeating timer to achieve decay effect
 def decay(channel):
-    global decayTimer
     currentVolume = Play.getVolume(channel)
-    newVolume = currentVolume - 3
+    newVolume = max(currentVolume - 3, 0)  # Ensure volume doesn't go below 0
 
-    if newVolume == 0: 
-        decayTimer.stop()
-        Play.allNotesOff()
-        return
-    
     Play.setVolume(newVolume)
+    if newVolume == 0: 
+        Play.allNotesOff()
 
-decayTimer = Timer(1, decay, [0], True) 
+# timer to call decay()
+decayTimer = Timer(DECAY_TIME_MS, decay, [0], True)
 
 # Parse accelerometer data from OSC messages
-accOSCIncrement = 0
 def parseAccelerometerData(message):
-    global accOSCIncrement, accelerometerValues
-
-    # accOSCMod = 4 # change sensitivity of acc
-    # accOSCIncrement = (accOSCIncrement + 1) % accOSCMod
-    # if accOSCIncrement % accOSCMod != 0: return
+    global accelerometerValues
 
     address = message.getAddress()
     accelerometerValues = message.getArguments()
 
-
 # Map accelerometer values to pitches
 def mapAccelerometerToPitch(x, y, z):
-    global scaleOfChords, scaleOfChordsRoot, onChordLock, offChordLock, keyRoot
+    global scaleOfChords, scaleOfChordsRoot, offChordLock
 
     # Ensure x and y are within range
-    if x > 0: x = 0.0
-    if y > 0: y = 0.0
-
-    if z > 1:
-        x = 0.0
-        y = 0.0
-        # print("z > 1")
-    elif z > 0 : 
-        x = -1.0
-        y = -1.0
-        # print("z > 0")
+    if x > 0.0: x = 0.0
+    if y > 0.0: y = 0.0
     
-    # map acc range to two octave range (17 notes), ex. C3-C5
-    xMapped = mapValue(x, -1.0, 1.0, 0, 16)
-    yMapped = mapValue(y, -1.0, 1.0, 16, 0)
-    zMapped = 0 # $$$ come back to this if need more accel input
+    # print("x: " + str(x))
+    # print("y: " + str(y))
+    # print("z: " + str(z))
+    # map acc range to octave + 1 range, ex. C4-C5
+    xMapped = mapValue(x, -1.0, 0.1, 0, 9)
+    yMapped = mapValue(y, -1.0, 0.0, 9, 0)
+    # zMapped = 0 # $$$ come back to this if need more accel input
 
-    # if on chord locked, only play even scale degrees
-    if onChordLock and xMapped % 2 == 1:
-        xMapped += 1
-    # if off chord locked, only play odd scale degrees
-    elif offChordLock and xMapped % 2 == 0:
-        xMapped += 1
-
-    # stay within the two octave range
-    xMapped %= 16
-    yMapped %= 16
+    if offChordLock: 
+        # if off chord locked, only play odd scale degrees
+        if xMapped % 2 == 0: xMapped += 1
+    
+    else: 
+        # if on chord locked, only play even scale degrees
+        if xMapped % 2 == 1: xMapped += 1
 
     # x
     octaveX = (xMapped // 8) + 4
     scaleDegree = xMapped % 8
-    pitchX = scaleOfChords[scaleDegree] + scaleOfChordsRoot + (octaveX * 12)
-    if scaleOfChordsRoot < keyRoot:
-        pitchX += 12
+    pitchX = scaleOfChords[scaleDegree] + scaleOfChordsRoot + (octaveX * OCTAVE)
 
     # y
-    octaveY = ((yMapped + 1) // 9) + 4
+    octaveY = (yMapped // 8) + 5
     scaleDegree = yMapped % 8
-    pitchY = scaleOfChords[scaleDegree] + scaleOfChordsRoot + (octaveY * 12)
-
-    # # z
-    # octaveZ = (zMapped // 8) + 4
-    # scaleDegree = zMapped % 8
-    # pitchZ = scaleOfChords[scaleDegree] + scaleOfChordsRoot + (octave * 12)
-    # if scaleOfChordsRoot < keyRoot:
-    #     pitchZ += 12
+    pitchY = scaleOfChords[scaleDegree] + scaleOfChordsRoot + (octaveY * OCTAVE)
     
     # print("Input Pitch: " + str(pitchX))
     return [pitchX, pitchY]
 
-
 # fill in the middle of contrary motion chords, take a note - skip a note
-def contraryMotion(inputPitch):
+def contraryMotion(contraryPitch):
     global pivotPitch, scaleOfChords, scaleOfChordsRoot
     chord = []
+    # print("\nPivot pitch: " + str(pivotPitch))
+    # print("Contrary pitch: " + str(contraryPitch))
 
     # If playing the pivot pitch, play one note
-    if inputPitch == pivotPitch:
-        chord.append(inputPitch)
+    if contraryPitch >= pivotPitch:
+        chord.append(pivotPitch)
         return chord
 
     # Map pitches to a pitch class (0 to 11),
     # adjusted to make "0" represent the scale root
-    inputPitchClass  = (inputPitch - scaleOfChordsRoot) % 12
-    pivotPitchClass = (pivotPitch - scaleOfChordsRoot) % 12
+    inputPitchClass  = (contraryPitch - scaleOfChordsRoot) % OCTAVE
+    pivotPitchClass = (pivotPitch - scaleOfChordsRoot) % OCTAVE
 
-    # print("\nPivot pitch: " + str(pivotPitch))
-    # print("Contrary pitch: " + str(inputPitch))
-
-    # # If input note is outside of the selected chord scale, play one note
-    # if inputPitchClass not in scaleOfChords:
-    #     chord.append(inputPitch)
-    #     return chord
-
-    inputOctave = inputPitch // 12 # the MIDI octave of the input note
+    inputOctave = contraryPitch // OCTAVE # the MIDI octave of the input note
     currentOctave = inputOctave
-    octaveSpread = (abs(inputPitch - pivotPitch)) // 12 # how many octaves apart are the input and pivot pitches?
+    octaveSpread = (abs(contraryPitch - pivotPitch)) // OCTAVE # how many octaves apart are the input and pivot pitches?
     inputScaleDegree = scaleOfChords.index(inputPitchClass) # the scale degree of the input note (0-7)
     pivotScaleDegree = scaleOfChords.index(pivotPitchClass) # the scale degree of the pivot note (0-7)
-    previousPitch = inputPitch
+    previousPitch = contraryPitch
 
     # How many notes should be in the chord?
     chordWidth = 1 + ((pivotScaleDegree - inputScaleDegree) % 8) + (8 * octaveSpread)
@@ -213,12 +189,12 @@ def contraryMotion(inputPitch):
     # until the desired chord width is achieved
     contrary = 0 # used for iteration to build the polyphony
     for note in range(1, chordWidth+1):
-        currentPitch = scaleOfChords[(inputScaleDegree + contrary) % 8] + scaleOfChordsRoot + (12 * (currentOctave - 1))
+        currentPitch = scaleOfChords[(inputScaleDegree + contrary) % 8] + scaleOfChordsRoot + (OCTAVE * (currentOctave - 1))
         
         # Keep adding higher notes
         if currentPitch < previousPitch:
             currentOctave += 1
-            currentPitch += 12
+            currentPitch += OCTAVE
         
         contrary += 2
         previousPitch = currentPitch
@@ -237,13 +213,11 @@ def contraryMotion(inputPitch):
     # Return the complete chord 
     return chord
 
-
 # keep the bottom note the same, while moving the notes above
 def obliqueMotion(inputPitch):
     # redundant, but named differently for clarity
     # may add more functionality to obliqueMotion later on
     setPivotPitch(inputPitch)
-
 
 # display and play the chord!
 def playChord(chord):
@@ -252,30 +226,28 @@ def playChord(chord):
     Play.setVolume(127)
     
     for note in chord:
+        note += TRANSPOSE_KEY_SEMITONES  #TODO:bandage
         Play.noteOn(note, volume, chordChannel)
-
 
 # change the chord scale TODO: this was not working for some reason with iteration ***
 def setScaleOfChords(newScaleOfChords):
     global scaleOfChords
     scaleOfChords = newScaleOfChords
 
-
 # change the root note of the chord scale
 def setScaleOfChordsRoot(newRoot):
     global scaleOfChordsRoot
     scaleOfChordsRoot = newRoot
 
-
-# change the pivot pitch
+# Change the pivot pitch
 def setPivotPitch(newPivotPitch):
     global pivotPitch
     pivotPitch = newPivotPitch   
 
-
-# plays a bass note for the chord numeral
+# Play a bass note for the chord numeral
 def toggleBassNote(bassNote, onOrOff):
     volume, channel = 100, 1 
+    bassNote += TRANSPOSE_KEY_SEMITONES
 
     if onOrOff == 1.0:
         # print("Bass note: " + str(bassNote))
@@ -286,10 +258,9 @@ def toggleBassNote(bassNote, onOrOff):
             try: Play.noteOff(bassNote, channel)
             except: bassNoteOn = False
 
-
-# play the appropriate chord from a touch input
+# Play the appropriate chord from a touch input
 def handleTouchInput(message):
-    global chordNumeralToButtonNameDict, buttonsHeld, accelerometerValues, decayTimer, eightChord, lastChord, bassNote
+    global chordNumeralToButtonNameDict, buttonsHeld, accelerometerValues, lastChord, bassNote
 
     address = message.getAddress()
     arguments = message.getArguments()
@@ -303,87 +274,79 @@ def handleTouchInput(message):
     if onOrOff == 0: 
         buttonsHeld -= 1
         if buttonsHeld == 0:
-            decayTimer.start() # turn volume down on a repeating timer, achieves decay effect
-            toggleBassNote(bassNote, onOrOff)
+            if DECAY: decayTimer.start() # turn volume down on a repeating timer, achieves decay effect
+            if BASS: toggleBassNote(bassNote, onOrOff)
         return
     else:
         buttonsHeld += 1
-        decayTimer.stop()
+        if DECAY: decayTimer.stop()
         
 
-    x, y, z = accelerometerValues
+    try: 
+        x, y, z = accelerometerValues
+    except:
+        print("\nTurn on the accelerometer in TouchOSC!!!\nSettings -> Options -> OSC -> Accelerometer (/accxyz)")
+        sys.exit(1)
+
     if  (-1.0 < x < 1.0) and (-1.0 < y < 1.0): 
         pitchX, pitchY = mapAccelerometerToPitch(x, y, z)
-
-    # if 8chord (1chord), raise x input pitch by an octave
-    if eightChord: 
-        try: pitchX += 12
-        except: None
-
-        try: pitchY += 12
-        except: None
     
-    try: obliqueMotion(pitchY)
-    except: pitchY = 0
-
+    try : obliqueMotion(pitchY)
+    except: NotImplemented
+    
     try: chord = contraryMotion(pitchX)
     except: chord = lastChord
     
     # play the appropriate chord
     lastChord = chord
     playChord(chord)
-    toggleBassNote(bassNote, onOrOff)
+    if BASS: toggleBassNote(bassNote, onOrOff)
     # print("Chord: " + str(chord))
 
-
-# update global variables based on what button was pressed
+# Update global variables based on what button was pressed
 def buttonOperations(buttonName):
-    global MAJOR_SIXTH_DIMINISHED_SCALE, MINOR_SIXTH_DIMINISHED_SCALE, DOMINANT_SEVENTH_FLAT_FIVE_DIMINISHED_SCALE
-    global key, keyRoot, onChordLock, offChordLock, alternate, dominant, familyUp, familyDown, familyAcross, lastButtonPressed, chordNumeral, eightChord, bassNote
-
-    bassRange = keyRoot + (12 * 2)
-    pivotRange = keyRoot + (12 * 4)
-    onChordLock = False
+    global KEY, offChordLock, alternate, dominant, familyUp, familyDown, familyAcross, chordNumeral, bassNote
     offChordLock = False      
 
-    # modifier buttons
-    if buttonName == "10": # On Chord Lock  
-        onChordLock = True
-        if familyUp:
-            makeFamilyDown()
-            familyUp = False
-        if familyDown:
-            makeFamilyUp()
-            familyDown = False
-        if familyAcross:
-            makeFamilyAcross()
-            familyAcross = False
-        if alternate or dominant:
+    # Handle modifier buttons
+    if buttonName == "10":   # On Chord lock
+        resetFamilyTransformations() 
+        if alternate or dominant: 
             makeDefault(chordNumeral)
-            alternate = False
-            dominant = False
-            onChordLock = True
-    elif buttonName == "h6": # Off Chord Lock
+    elif buttonName == "h6": # Off Chord lock
         offChordLock = True
     elif buttonName == "14": # "Alt" button
-        onChordLock = True
-        if familyAcross: 
-            makeFamilyAcross()
-            familyAcross = False
-        if familyDown: 
-            makeFamilyUp()
-            familyDown = False
-        if familyUp: 
-            makeFamilyDown()
-            familyDown = False
+        resetFamilyTransformations()
         if not alternate: 
             makeAlternate(chordNumeral)
             alternate = True
     elif buttonName == "h2": # "Make Dominant" Button, turns any chord into a Dom7
-        onChordLock = True
         makeDominant()
+    elif buttonName == "h5": # Family Down / "Sister" Button, transform down a minor third
+        if familyUp: 
+            makeFamilyDown()
+            familyUp = False
+        if familyAcross: 
+            makeFamilyAcross()
+            familyAcross = False
+        if alternate or dominant: 
+            makeDefault(chordNumeral)
+        if not familyDown: 
+            makeFamilyDown()
+            familyDown = True # Call helper function
+    elif buttonName == "h9": # Family Across / "Cousin" Button, transform across a tritone
+        if familyUp: 
+            makeFamilyDown()
+            familyUp = False
+        if familyDown: 
+            makeFamilyUp()
+            familyDown = False
+        if alternate or dominant: 
+            makeDefault(chordNumeral)
+        if not familyAcross: 
+            makeFamilyAcross()
+            familyAcross = True
     elif buttonName == "13": # "Family Up / Brother" Button, transform up minor third
-        onChordLock = True
         if familyAcross:
             makeFamilyAcross()
             familyAcross = False
@@ -392,169 +355,123 @@ def buttonOperations(buttonName):
             familyDown = False
         if alternate or dominant: 
             makeDefault(chordNumeral)
-            alternate = False
-            dominant = False
-            onChordLock = True
         if not familyUp: 
             makeFamilyUp()
             familyUp = True
-    elif buttonName == "h9": # Family Across / "Cousin" Button, transform across a tritone
-        onChordLock = True
-        if familyUp: 
-            makeFamilyDown()
-            familyUp = False
-        if familyDown: 
-            makeFamilyUp()
-            familyDown = False
-        if alternate or dominant: 
-            makeDefault(chordNumeral)
-            alternate = False
-            dominant = False
-            onChordLock = True
-        if not familyAcross: 
-            makeFamilyAcross()
-            familyAcross = True
-    elif buttonName == "h5": # Family Down / "Sister" Button, transform down a minor third
-        onChordLock = True
-        if familyUp: 
-            makeFamilyDown()
-            familyUp = False
-        if familyAcross: 
-            makeFamilyAcross()
-            familyAcross = False
-        if not familyDown: 
-            makeFamilyDown()
-            familyDown = True
-    elif buttonName == lastButtonPressed: # if the button is the same and also a chord button, we don't need to change anything
-        return
     else:
-        if familyAcross: 
-            makeFamilyAcross()
-            familyAcross = False
-        if familyDown: 
-            makeFamilyUp()
-            familyDown = False
-        if familyUp: 
-            makeFamilyDown()
-            familyDown = False
-        if  alternate or dominant: 
-            alternate = False
-            dominant = False
-            makeDefault(chordNumeral)
-            
+        handleChordNumerals(buttonName)  # Call the function to handle chord numerals
 
-        for b in [familyDown, familyUp, familyAcross, alternate]: b = False
-        
-    # chord buttons
-    if buttonName == "16": # 1 chord
+# Reset family transformations
+def resetFamilyTransformations():
+    global familyUp, familyDown, familyAcross
+    
+    if familyUp:
+        makeFamilyDown()
+        familyUp = False
+    if familyDown:
+        makeFamilyUp()
+        familyDown = False
+    if familyAcross:
+        makeFamilyAcross()
+        familyAcross = False
+
+# Chord numeral buttons logic
+def handleChordNumerals(buttonName):
+    global chordNumeral, bassNote, offChordLock
+
+    resetFamilyTransformations()
+    # Set offChordLock to False
+    offChordLock = False
+
+    # Logic for setting chord numerals and bass notes
+    if buttonName == "16":  # 1 chord
         chordNumeral = 1
-        bassNote = key[0] + bassRange
+        bassNote = KEY[0] + BASS_OCTAVE_OFFSET
         setScaleOfChords(MAJOR_SIXTH_DIMINISHED_SCALE)
-        setScaleOfChordsRoot(key[0] + keyRoot)
-        eightChord = False
-    elif buttonName == "12": # 2 chord
+        setScaleOfChordsRoot( KEY[0] )
+    elif buttonName == "12":  # 2 chord
         chordNumeral = 2
-        bassNote = key[1] + bassRange
+        bassNote = KEY[1] + BASS_OCTAVE_OFFSET
         setScaleOfChords(MINOR_SEVENTH_DIMINISHED_SCALE)
-        setScaleOfChordsRoot((key[1] + keyRoot) % 12)
-        eightChord = False
-    elif buttonName == "h8": # 3 chord
+        setScaleOfChordsRoot( KEY[1] )
+    elif buttonName == "h8":  # 3 chord
         chordNumeral = 3
-        bassNote = key[2] + bassRange
+        bassNote = KEY[2] + BASS_OCTAVE_OFFSET
         setScaleOfChords(MINOR_SEVENTH_DIMINISHED_SCALE)
-        setScaleOfChordsRoot((key[2] + keyRoot) % 12)
-        eightChord = False
-    elif buttonName == "h4": # 4 chord
+        setScaleOfChordsRoot( KEY[2] )
+    elif buttonName == "h4":  # 4 chord
         chordNumeral = 4
-        bassNote = key[3] + bassRange
+        bassNote = KEY[3] + BASS_OCTAVE_OFFSET
         setScaleOfChords(MAJOR_SIXTH_DIMINISHED_SCALE)
-        setScaleOfChordsRoot((key[3] + keyRoot) % 12)
-        eightChord = False
-    elif buttonName == "15": # 5 chord
+        setScaleOfChordsRoot( KEY[3] )
+    elif buttonName == "15":  # 5 chord
         chordNumeral = 5
-        bassNote = key[4] + bassRange
+        bassNote = KEY[4] + BASS_OCTAVE_OFFSET
         setScaleOfChords(DOMINANT_SEVENTH_DIMINISHED_SCALE)
-        setScaleOfChordsRoot(key[4] + keyRoot)
-        eightChord = False
-    elif buttonName == "11": # 6 chord
+        setScaleOfChordsRoot( KEY[4] )
+    elif buttonName == "11":  # 6 chord
         chordNumeral = 6
-        bassNote = key[5] + bassRange
+        bassNote = KEY[5] + BASS_OCTAVE_OFFSET
         setScaleOfChords(MINOR_SEVENTH_DIMINISHED_SCALE)
-        setScaleOfChordsRoot((key[5] + keyRoot) % 12)
-        eightChord = False
-    elif buttonName == "h7": # 7 chord
+        setScaleOfChordsRoot( KEY[5] )
+    elif buttonName == "h7":  # 7 chord
         chordNumeral = 7
-        bassNote = key[6] + bassRange
+        bassNote = KEY[6] + BASS_OCTAVE_OFFSET
         setScaleOfChords(MINOR_SEVENTH_FLAT_FIVE_DIMINISHED_SCALE)
-        setScaleOfChordsRoot((key[6] + keyRoot) % 12)
-        eightChord = False
-    elif buttonName == "h3": # 1 chord + 1 octave, aka 8 chord
+        setScaleOfChordsRoot( KEY[6] )
+    elif buttonName == "h3":  # 1 chord + 1 octave, aka 8 chord
         chordNumeral = 8
-        eightChord = True
-        bassNote = key[0] + bassRange + 12
+        bassNote = KEY[0] + BASS_OCTAVE_OFFSET + OCTAVE
         setScaleOfChords(MAJOR_SIXTH_DIMINISHED_SCALE)
-        setScaleOfChordsRoot((key[0] + keyRoot) % 12)
-    
-    # Whenever we first hit a button, we should hear the "on chord"
-    if buttonName not in [lastButtonPressed, "10", "h6"]:
-        onChordLock = True
-        lastButtonPressed = buttonName
-    
-    lastButtonPressed = buttonName
+        setScaleOfChordsRoot( KEY[0] + OCTAVE )
     
     return True
 
-# switch to an alternate scale of chords based on the current chord numeral
+# Switch to an alternate scale of chords based on the current chord numeral
 def makeAlternate(chordNumeral):
-    global key, keyRoot
-    
+    global KEY, alternate
     # print("\nAlt scale of chords")
 
     if chordNumeral in [1, 8]: # 1 chord alt
         # the major 6th on the 5
         # Ex: Cmaj6 --> Gmaj6/C (Cmaj9)
         setScaleOfChords(MAJOR_SIXTH_DIMINISHED_SCALE_FROM_FIFTH)
-        setScaleOfChordsRoot(key[1] + keyRoot)
+        setScaleOfChordsRoot( KEY[1] )
     elif chordNumeral == 2: # 2 chord alt
         # Ex: Dmin7 --> Cmaj6/D (Dmin11)
         setScaleOfChords(MAJOR_SIXTH_DIMINISHED_SCALE_FROM_THIRD)
-        setScaleOfChordsRoot(key[2] + keyRoot)
+        setScaleOfChordsRoot( KEY[2] )
     elif chordNumeral == 3: # 3 chord alt
         # Ex: Emin7 --> Cmaj6/E
         setScaleOfChords(MAJOR_SIXTH_DIMINISHED_SCALE_FROM_THIRD)
-        setScaleOfChordsRoot(key[2] + keyRoot)
+        setScaleOfChordsRoot( KEY[2] )
     elif chordNumeral == 4: # 4 chord alt
         # Ex: Fmaj6dim --> Cmaj6dim/F (Fmaj9)
         setScaleOfChords(MAJOR_SIXTH_DIMINISHED_SCALE_FROM_FIFTH)
-        setScaleOfChordsRoot(key[4] + keyRoot)
+        setScaleOfChordsRoot( KEY[4] )
     elif chordNumeral == 5: # 5 chord alt
         # minor 6th on the 5
         # Ex: G7dim --> Dmin6dim/G
         setScaleOfChords(MINOR_SIXTH_DIMINISHED_SCALE_FROM_FIFTH)
-        setScaleOfChordsRoot(key[5] + keyRoot)
+        setScaleOfChordsRoot( KEY[5] )
     elif chordNumeral == 6:
-        # dominant 6 chord sound
         # Ex: Amin7 --> Gmaj6/A (Amin11)
         setScaleOfChords(MAJOR_SIXTH_DIMINISHED_SCALE_FROM_THIRD)
-        setScaleOfChordsRoot(key[6] + keyRoot)
+        setScaleOfChordsRoot( KEY[6] )
     elif chordNumeral == 7:
         # Ex: Bmin7b5 --> G7/B
-        # BDFA -->CDFA
         setScaleOfChords(DOMINANT_SEVENTH_DIMINISHED_SCALE_FROM_THIRD)
-        setScaleOfChordsRoot(key[6] + keyRoot)
+        setScaleOfChordsRoot( KEY[6] )
 
+    alternate = True
 
-# make the current scale of chords a dominant seventh diminished scale with the same root
+# Make current scale of chords a dominant seventh diminished scale with the same root
 def makeDominant():
-    global DOMINANT_SEVENTH_DIMINISHED_SCALE
+    global dominant
     setScaleOfChords(DOMINANT_SEVENTH_DIMINISHED_SCALE)
+    dominant = True
 
-# reset the default scale of chords for the current chord numeral
-def makeDefault(chordNumeral):
-    buttonName = chordNumeralToButtonNameDict.get(chordNumeral)
-    buttonOperations(buttonName)
-
-# switch to family a minor third up
+# Switch to family a minor third up
 def makeFamilyUp():
     global scaleOfChords, scaleOfChordsRoot
     # bass note of scale of chords goes down in cycle through 1 - 3 - 5 - 6/7, for voice leading
@@ -594,8 +511,10 @@ def makeFamilyUp():
         setScaleOfChords(DOMINANT_SEVENTH_DIMINISHED_SCALE_FROM_THIRD)
     elif scaleOfChords == DOMINANT_SEVENTH_DIMINISHED_SCALE_FROM_SEVENTH:
         setScaleOfChords(DOMINANT_SEVENTH_DIMINISHED_SCALE_FROM_FIFTH)
+    
+    familyUp = True
 
-# switch to family a minor third down
+# Switch to family a minor third down
 def makeFamilyDown():
     global scaleOfChords, scaleOfChordsRoot
     # bass note of scale of chords goes up in cycle through 1 - 3 - 5 - 6/7, for voice leading
@@ -636,7 +555,9 @@ def makeFamilyDown():
         setScaleOfChords(DOMINANT_SEVENTH_DIMINISHED_SCALE)
         setScaleOfChordsRoot(scaleOfChordsRoot - 1)
 
-# switch to family a tritone across
+    familyDown = True
+
+# Switch to family a tritone across
 def makeFamilyAcross():
     global scaleOfChords, scaleOfChordsRoot
     # bass note of scale of chords go between 1 - 5  or 3 - 6/7, for voice leading
@@ -678,34 +599,51 @@ def makeFamilyAcross():
         setScaleOfChordsRoot(scaleOfChordsRoot - 1)
     elif scaleOfChords == DOMINANT_SEVENTH_DIMINISHED_SCALE_FROM_SEVENTH:
         setScaleOfChords(DOMINANT_SEVENTH_DIMINISHED_SCALE_FROM_THIRD)
+
+    familyAcross = True
+
+# Reset to default scale of chords for the current chord numeral
+def makeDefault(chordNumeral):
+    global alternate, dominant
+    alternate = False
+    dominant = False
+    buttonName = chordNumeralToButtonNameDict.get(chordNumeral)
+    buttonOperations(buttonName)
 # endregion
 
 # region OSC and MIDI Setup
-
-# Initialize OSC input to receive messages
-oscIn = OscIn()
+oscIn = OscIn( OSC_LISTENER_PORT )  
 oscIn.hideMessages()
-
-# OSC listeners
 oscIn.onInput("/7/push.*", handleTouchInput) 
 oscIn.onInput("/accxyz", parseAccelerometerData) 
-
-# Set MIDI Instruments, such as SQUARE, PIANO, MUSIC_BOX, SYNTH_BASS, CONTRABASS
-Play.setInstrument(SQUARE, 0) # choose a MIDI instrument
-Play.setInstrument(CONTRABASS, 1) # choose bass sound
 # endregion
 
 # region ASCII Art and Intro Message
 ascii_art = """
- __  __ _   _  ____
-|  \/  | \ | |/ ___|
-| |\/| |  \| | |   
-| |  | | |\  | |___
-|_|  |_|_| \_|\____|
+ __  __ _   _  ____ 
+|  \/  | \ | |/ ___| 
+| |\/| |  \| | |     
+| |  | | |\  | |___  
+|_|  |_|_| \_|\____| 
 """
 
 print(ascii_art)
-print("\"You know... Coleman Hawkins, when I worked with him, he told me \'I don't play chords, I play movements.\'\n\
-I understand it now.\" - Barry Harris\n")
+print("\"You know... Coleman Hawkins, when I worked with him,\n" +  
+        "he told me \'I don't play chords, I play movements.\'\n" +
+        "I understand it now.\" - Barry Harris\n")
 print("Play movements, not chords!")
+# endregion
+
+# region Changelog
+# 11.16.24:
+# Added global transpose, bass, and decay settings. Cleaned up octave logic.
+# Refactored buttonOperations() with clearer helper functions.
+#
+# 7.30.24:
+# Chords only play when tapped. Limited to 4 voices for polyphonic clarity. 
+# When switching to a different chord, always locks to on chord. Bass note plays for chord button.
+# Contrary motion on roll, and oblique motion (holding bottom note) on pitch.
+# Separated buttonOperations into its own function to clean up handleTouchInputs.
+# Alternate scale of chords button added. "Make Dominant" button Added.
+# Family up, down, and across added.
 # endregion
